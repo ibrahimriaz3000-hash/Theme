@@ -1,0 +1,96 @@
+name: Build ThemeCompatFix
+
+on:
+  push:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - name: Setup Android SDK
+        run: |
+          export ANDROID_SDK_ROOT="${ANDROID_SDK_ROOT:-$ANDROID_HOME}"
+          yes | sdkmanager --licenses > /dev/null || true
+          sdkmanager "platforms;android-34" "build-tools;34.0.0" > /dev/null
+
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: 8.4
+
+      - name: Find project (zip ho to unzip karo)
+        id: proj
+        run: |
+          set -e
+          ZIP=$(ls -1 *.zip 2>/dev/null | head -n 1 || true)
+          if [ -n "$ZIP" ]; then
+            echo "Zip mili: $ZIP"
+            rm -rf _proj && mkdir _proj
+            unzip -q -o "$ZIP" -d _proj
+            SETTINGS=$(find _proj -maxdepth 3 -name settings.gradle -o -maxdepth 3 -name settings.gradle.kts | head -n 1)
+          else
+            SETTINGS=$(find . -maxdepth 3 \( -name settings.gradle -o -name settings.gradle.kts \) -not -path "./_proj/*" | head -n 1)
+          fi
+          if [ -z "$SETTINGS" ]; then
+            echo "ERROR: settings.gradle nahi mili"
+            exit 1
+          fi
+          DIR=$(dirname "$SETTINGS")
+          echo "Project dir: $DIR"
+          echo "dir=$DIR" >> "$GITHUB_OUTPUT"
+
+      - name: Build debug APK
+        run: gradle -p "${{ steps.proj.outputs.dir }}" assembleDebug --stacktrace --no-daemon
+
+      - name: Verify APK (LSPosed module check)
+        run: |
+          APK=$(find "${{ steps.proj.outputs.dir }}" -path "*outputs/apk/debug/*.apk" | head -n 1)
+          if [ -z "$APK" ]; then
+            echo "ERROR: APK nahi bani"
+            exit 1
+          fi
+          echo "APK: $APK"
+          ls -lh "$APK"
+          unzip -l "$APK" | grep -q "assets/xposed_init" \
+            && echo "xposed_init OK" \
+            || { echo "ERROR: xposed_init APK mein nahi hai"; exit 1; }
+          echo "APK_PATH=$APK" >> "$GITHUB_ENV"
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: ThemeCompatFix-debug
+          path: ${{ env.APK_PATH }}
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Upload build reports (fail ho to)
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-reports
+          path: |
+            **/build/reports/**
+            **/build/outputs/logs/**
+          if-no-files-found: ignore
+          retention-days: 7
