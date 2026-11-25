@@ -1,9 +1,18 @@
-name: Build ChargeAnimPro
+name: Build APK
 
 on:
   push:
-    branches: [ main, master ]
+    branches: ["**"]
+    tags: ["v*"]
+    paths-ignore: ["**.md", "README.txt"]
+  pull_request:
   workflow_dispatch:
+    inputs:
+      build_type:
+        description: "Kya build karna hai?"
+        type: choice
+        options: [both, debug, release]
+        default: both
 
 permissions:
   contents: read
@@ -12,77 +21,202 @@ concurrency:
   group: build-${{ github.ref }}
   cancel-in-progress: true
 
+env:
+  GRADLE_VERSION: "8.7"
+  JAVA_VERSION: "17"
+  APP_NAME: DynamicPill
+
 jobs:
   build:
+    name: Build (${{ github.event.inputs.build_type || 'both' }})
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 40
+    env:
+      HAS_KEYSTORE: ${{ secrets.KEYSTORE_BASE64 != '' }}
+    outputs:
+      version: ${{ steps.meta.outputs.version }}
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Setup JDK 17
+      # Project files seedhe repo me hon YA repo root me .zip ho - dono chalta hai
+      - name: Find project (unzip if needed)
+        run: |
+          if [ -f settings.gradle ] || [ -f settings.gradle.kts ]; then
+            echo "PROJECT_DIR=." >> "$GITHUB_ENV"
+            echo "Project files repo root me mil gaye"
+            exit 0
+          fi
+          ZIP="$(ls -t ./*.zip 2>/dev/null | head -n 1 || true)"
+          if [ -z "$ZIP" ]; then
+            echo "::error::settings.gradle nahi mila aur repo root me koi .zip bhi nahi"
+            ls -la; exit 1
+          fi
+          echo "Zip use ho raha hai: $ZIP"
+          mkdir -p _proj
+          unzip -q -o "$ZIP" -d _proj
+          SETTINGS="$(find _proj \( -name settings.gradle -o -name settings.gradle.kts \) -not -path '*/__MACOSX/*' | head -n 1)"
+          if [ -z "$SETTINGS" ]; then
+            echo "::error::zip me settings.gradle nahi hai"
+            find _proj -maxdepth 3 | head -50; exit 1
+          fi
+          echo "PROJECT_DIR=$(dirname "$SETTINGS")" >> "$GITHUB_ENV"
+
+      - name: Read version from app/build.gradle
+        id: meta
+        run: |
+          G="$PROJECT_DIR/app/build.gradle"
+          VN="$(grep -oP 'versionName\s*["'\'']\K[^"'\'']+' "$G" | head -n1 || true)"
+          VC="$(grep -oP 'versionCode\s+\K[0-9]+' "$G" | head -n1 || true)"
+          echo "version=${VN:-unknown}" >> "$GITHUB_OUTPUT"
+          echo "code=${VC:-0}" >> "$GITHUB_OUTPUT"
+          echo "Version: ${VN:-unknown} (code ${VC:-0})"
+
+      - name: Set up JDK ${{ env.JAVA_VERSION }}
         uses: actions/setup-java@v4
         with:
           distribution: temurin
-          java-version: 17
+          java-version: ${{ env.JAVA_VERSION }}
 
-      - name: Setup Gradle
+      - name: Set up Android SDK licenses
+        run: yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses >/dev/null 2>&1 || true
+
+      - name: Set up Gradle ${{ env.GRADLE_VERSION }} (with cache)
         uses: gradle/actions/setup-gradle@v4
         with:
-          gradle-version: 8.4
+          gradle-version: ${{ env.GRADLE_VERSION }}
+          cache-read-only: ${{ github.ref != 'refs/heads/main' && github.ref != 'refs/heads/master' }}
 
-      - name: Find project
-        id: proj
+      - name: Pre-check Xposed API repo
+        continue-on-error: true
+        run: |
+          code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 20 https://api.xposed.info/de/robv/android/xposed/api/82/api-82.pom || echo 000)"
+          echo "api.xposed.info HTTP $code"
+          if [ "$code" != "200" ]; then
+            echo "::warning::api.xposed.info down/slow hai (HTTP $code) - build retry karega"
+          fi
+
+      - name: Build APK(s)
+        env:
+          BUILD_TYPE: ${{ github.event.inputs.build_type || 'both' }}
+        run: |
+          cd "$PROJECT_DIR"
+          case "$BUILD_TYPE" in
+            debug)   TASKS="assembleDebug" ;;
+            release) TASKS="assembleRelease" ;;
+            *)       TASKS="assembleDebug assembleRelease" ;;
+          esac
+          echo "Tasks: $TASKS"
+          set -o pipefail
+          ok=0
+          for i in 1 2 3; do
+            if gradle $TASKS --no-daemon --stacktrace --console=plain \
+                 -Dorg.gradle.internal.http.connectionTimeout=60000 \
+                 -Dorg.gradle.internal.http.socketTimeout=60000 2>&1 | tee -a "$GITHUB_WORKSPACE/build.log"; then
+              ok=1; break
+            fi
+            echo "::warning::Attempt $i fail hua, 45s baad dobara"
+            sleep 45
+          done
+          [ "$ok" = "1" ] || { echo "::error::3 koshishon ke baad bhi build fail"; exit 1; }
+
+      - name: Optional re-sign release with your own keystore
+        if: env.HAS_KEYSTORE == 'true'
+        env:
+          KS_B64: ${{ secrets.KEYSTORE_BASE64 }}
+          KS_PASS: ${{ secrets.KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
+          KEY_PASS: ${{ secrets.KEY_PASSWORD }}
         run: |
           set -e
-          SEARCH=.
-          if ls *.zip > /dev/null 2>&1; then
-            ZIP=$(ls -1 *.zip | head -n 1)
-            echo "Zip mili: $ZIP"
-            rm -rf _proj
-            mkdir _proj
-            unzip -q -o "$ZIP" -d _proj
-            SEARCH=_proj
-          fi
-          SETTINGS=$(find "$SEARCH" -maxdepth 3 -name 'settings.gradle*' | head -n 1)
-          if [ -z "$SETTINGS" ]; then
-            echo "ERROR: settings.gradle nahi mili"
-            exit 1
-          fi
-          DIR=$(dirname "$SETTINGS")
-          echo "Project dir: $DIR"
-          echo "dir=$DIR" >> "$GITHUB_OUTPUT"
+          echo "$KS_B64" | base64 -d > "$RUNNER_TEMP/release.jks"
+          BT="$(ls -d "$ANDROID_HOME"/build-tools/* | sort -V | tail -n1)"
+          for apk in "$PROJECT_DIR"/app/build/outputs/apk/release/*.apk; do
+            [ -f "$apk" ] || continue
+            "$BT/apksigner" sign --ks "$RUNNER_TEMP/release.jks" \
+              --ks-pass "pass:$KS_PASS" --ks-key-alias "$KEY_ALIAS" \
+              --key-pass "pass:${KEY_PASS:-$KS_PASS}" "$apk"
+          done
+          rm -f "$RUNNER_TEMP/release.jks"
 
-      - name: Build debug APK
-        run: gradle -p "${{ steps.proj.outputs.dir }}" assembleDebug --stacktrace --no-daemon
-
-      - name: Verify APK
+      - name: Collect, verify and checksum APKs
+        id: collect
         run: |
-          APK=$(find "${{ steps.proj.outputs.dir }}" -path '*outputs/apk/debug/*.apk' | head -n 1)
-          if [ -z "$APK" ]; then
-            echo "ERROR: APK nahi bani"
-            exit 1
-          fi
-          echo "APK: $APK"
-          ls -lh "$APK"
-          unzip -l "$APK" | grep "assets/xposed_init"
-          echo "APK_PATH=$APK" >> "$GITHUB_ENV"
+          set -e
+          VER="${{ steps.meta.outputs.version }}"
+          SHORT="$(echo "$GITHUB_SHA" | cut -c1-7)"
+          BT="$(ls -d "$ANDROID_HOME"/build-tools/* | sort -V | tail -n1)"
+          mkdir -p out
+          for t in debug release; do
+            for apk in "$PROJECT_DIR"/app/build/outputs/apk/$t/*.apk; do
+              [ -f "$apk" ] || continue
+              dest="out/${APP_NAME}-v${VER}-${t}-${SHORT}.apk"
+              cp "$apk" "$dest"
+              "$BT/apksigner" verify --print-certs "$dest" | head -n 3
+              "$BT/aapt" dump badging "$dest" | grep -E "^package:|sdkVersion" || true
+              # Xposed module sanity check
+              unzip -p "$dest" AndroidManifest.xml >/dev/null
+              unzip -l "$dest" | grep -q "assets/xposed_init" \
+                || { echo "::error::$dest me assets/xposed_init nahi hai"; exit 1; }
+            done
+          done
+          ls out/*.apk >/dev/null 2>&1 || { echo "::error::Koi APK nahi bani"; exit 1; }
+          (cd out && sha256sum *.apk | tee SHA256SUMS.txt)
 
-      - name: Upload APK
+          {
+            echo "## ✅ ${APP_NAME} v${VER} build ho gaya"
+            echo ""
+            echo "| File | Size |"
+            echo "|---|---|"
+            for f in out/*.apk; do
+              echo "| \`$(basename "$f")\` | $(du -h "$f" | cut -f1) |"
+            done
+            echo ""
+            echo '```'
+            cat out/SHA256SUMS.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload APKs
         uses: actions/upload-artifact@v4
         with:
-          name: ChargeAnimPro-debug
-          path: ${{ env.APK_PATH }}
+          name: ${{ env.APP_NAME }}-apk
+          path: |
+            out/*.apk
+            out/SHA256SUMS.txt
           if-no-files-found: error
           retention-days: 30
 
-      - name: Upload build reports
-        if: failure()
+      - name: Upload build log
+        if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: build-reports
-          path: |
-            **/build/reports/**
+          name: build-log
+          path: build.log
           if-no-files-found: ignore
           retention-days: 7
+
+  # Tag push (jaise v2.3) par automatic GitHub Release
+  release:
+    name: Publish GitHub Release
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download APKs
+        uses: actions/download-artifact@v4
+        with:
+          name: DynamicPill-apk
+          path: out
+
+      - name: Create release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: Dynamic Pill ${{ github.ref_name }}
+          generate_release_notes: true
+          files: |
+            out/*.apk
+            out/SHA256SUMS.txt
