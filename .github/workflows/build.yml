@@ -32,27 +32,7 @@ jobs:
         with:
           gradle-version: 8.4
 
-      - name: Accept Android licenses
-        continue-on-error: true
-        run: |
-          SDKM="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
-          if [ -x "$SDKM" ]; then
-            yes | "$SDKM" --licenses > /dev/null || true
-          else
-            echo "sdkmanager nahi mila, Gradle khud licenses handle karega"
-          fi
-
-      - name: Find project (zip ho to unzip karo)
+      - name: Find project
         id: proj
         run: |
-          set -e
-          ZIP=$(ls -1 *.zip 2>/dev/null | head -n 1 || true)
-          if [ -n "$ZIP" ]; then
-            echo "Zip mili: $ZIP"
-            rm -rf _proj && mkdir _proj
-            unzip -q -o "$ZIP" -d _proj
-            SEARCH=_proj
-          else
-            SEARCH=.
-          fi
-          SETTINGS=$(find "$SEARCH" -maxdept
+          set
