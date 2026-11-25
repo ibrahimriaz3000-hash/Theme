@@ -67,6 +67,10 @@ jobs:
         id: meta
         run: |
           G="$PROJECT_DIR/app/build.gradle"
+          if [ ! -f "$G" ]; then
+            echo "::error::app/build.gradle nahi mila (zip/repo me app/build.gradle hona zaroori hai)"
+            exit 1
+          fi
           VN="$(grep -oP 'versionName\s*["'\'']\K[^"'\'']+' "$G" | head -n1 || true)"
           VC="$(grep -oP 'versionCode\s+\K[0-9]+' "$G" | head -n1 || true)"
           echo "version=${VN:-unknown}" >> "$GITHUB_OUTPUT"
@@ -99,124 +103,3 @@ jobs:
 
       - name: Build APK(s)
         env:
-          BUILD_TYPE: ${{ github.event.inputs.build_type || 'both' }}
-        run: |
-          cd "$PROJECT_DIR"
-          case "$BUILD_TYPE" in
-            debug)   TASKS="assembleDebug" ;;
-            release) TASKS="assembleRelease" ;;
-            *)       TASKS="assembleDebug assembleRelease" ;;
-          esac
-          echo "Tasks: $TASKS"
-          set -o pipefail
-          ok=0
-          for i in 1 2 3; do
-            if gradle $TASKS --no-daemon --stacktrace --console=plain \
-                 -Dorg.gradle.internal.http.connectionTimeout=60000 \
-                 -Dorg.gradle.internal.http.socketTimeout=60000 2>&1 | tee -a "$GITHUB_WORKSPACE/build.log"; then
-              ok=1; break
-            fi
-            echo "::warning::Attempt $i fail hua, 45s baad dobara"
-            sleep 45
-          done
-          [ "$ok" = "1" ] || { echo "::error::3 koshishon ke baad bhi build fail"; exit 1; }
-
-      - name: Optional re-sign release with your own keystore
-        if: env.HAS_KEYSTORE == 'true'
-        env:
-          KS_B64: ${{ secrets.KEYSTORE_BASE64 }}
-          KS_PASS: ${{ secrets.KEYSTORE_PASSWORD }}
-          KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
-          KEY_PASS: ${{ secrets.KEY_PASSWORD }}
-        run: |
-          set -e
-          echo "$KS_B64" | base64 -d > "$RUNNER_TEMP/release.jks"
-          BT="$(ls -d "$ANDROID_HOME"/build-tools/* | sort -V | tail -n1)"
-          for apk in "$PROJECT_DIR"/app/build/outputs/apk/release/*.apk; do
-            [ -f "$apk" ] || continue
-            "$BT/apksigner" sign --ks "$RUNNER_TEMP/release.jks" \
-              --ks-pass "pass:$KS_PASS" --ks-key-alias "$KEY_ALIAS" \
-              --key-pass "pass:${KEY_PASS:-$KS_PASS}" "$apk"
-          done
-          rm -f "$RUNNER_TEMP/release.jks"
-
-      - name: Collect, verify and checksum APKs
-        id: collect
-        run: |
-          set -e
-          VER="${{ steps.meta.outputs.version }}"
-          SHORT="$(echo "$GITHUB_SHA" | cut -c1-7)"
-          BT="$(ls -d "$ANDROID_HOME"/build-tools/* | sort -V | tail -n1)"
-          mkdir -p out
-          for t in debug release; do
-            for apk in "$PROJECT_DIR"/app/build/outputs/apk/$t/*.apk; do
-              [ -f "$apk" ] || continue
-              dest="out/${APP_NAME}-v${VER}-${t}-${SHORT}.apk"
-              cp "$apk" "$dest"
-              "$BT/apksigner" verify --print-certs "$dest" | head -n 3
-              "$BT/aapt" dump badging "$dest" | grep -E "^package:|sdkVersion" || true
-              # Xposed module sanity check
-              unzip -p "$dest" AndroidManifest.xml >/dev/null
-              unzip -l "$dest" | grep -q "assets/xposed_init" \
-                || { echo "::error::$dest me assets/xposed_init nahi hai"; exit 1; }
-            done
-          done
-          ls out/*.apk >/dev/null 2>&1 || { echo "::error::Koi APK nahi bani"; exit 1; }
-          (cd out && sha256sum *.apk | tee SHA256SUMS.txt)
-
-          {
-            echo "## ✅ ${APP_NAME} v${VER} build ho gaya"
-            echo ""
-            echo "| File | Size |"
-            echo "|---|---|"
-            for f in out/*.apk; do
-              echo "| \`$(basename "$f")\` | $(du -h "$f" | cut -f1) |"
-            done
-            echo ""
-            echo '```'
-            cat out/SHA256SUMS.txt
-            echo '```'
-          } >> "$GITHUB_STEP_SUMMARY"
-
-      - name: Upload APKs
-        uses: actions/upload-artifact@v4
-        with:
-          name: ${{ env.APP_NAME }}-apk
-          path: |
-            out/*.apk
-            out/SHA256SUMS.txt
-          if-no-files-found: error
-          retention-days: 30
-
-      - name: Upload build log
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: build-log
-          path: build.log
-          if-no-files-found: ignore
-          retention-days: 7
-
-  # Tag push (jaise v2.3) par automatic GitHub Release
-  release:
-    name: Publish GitHub Release
-    needs: build
-    if: startsWith(github.ref, 'refs/tags/v')
-    runs-on: ubuntu-latest
-    permissions:
-      contents: write
-    steps:
-      - name: Download APKs
-        uses: actions/download-artifact@v4
-        with:
-          name: DynamicPill-apk
-          path: out
-
-      - name: Create release
-        uses: softprops/action-gh-release@v2
-        with:
-          name: Dynamic Pill ${{ github.ref_name }}
-          generate_release_notes: true
-          files: |
-            out/*.apk
-            out/SHA256SUMS.txt
