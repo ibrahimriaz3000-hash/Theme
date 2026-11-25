@@ -35,4 +35,54 @@ jobs:
       - name: Find project
         id: proj
         run: |
-          set
+          set -e
+          SEARCH=.
+          if ls *.zip > /dev/null 2>&1; then
+            ZIP=$(ls -1 *.zip | head -n 1)
+            echo "Zip mili: $ZIP"
+            rm -rf _proj
+            mkdir _proj
+            unzip -q -o "$ZIP" -d _proj
+            SEARCH=_proj
+          fi
+          SETTINGS=$(find "$SEARCH" -maxdepth 3 -name 'settings.gradle*' | head -n 1)
+          if [ -z "$SETTINGS" ]; then
+            echo "ERROR: settings.gradle nahi mili"
+            exit 1
+          fi
+          DIR=$(dirname "$SETTINGS")
+          echo "Project dir: $DIR"
+          echo "dir=$DIR" >> "$GITHUB_OUTPUT"
+
+      - name: Build debug APK
+        run: gradle -p "${{ steps.proj.outputs.dir }}" assembleDebug --stacktrace --no-daemon
+
+      - name: Verify APK
+        run: |
+          APK=$(find "${{ steps.proj.outputs.dir }}" -path '*outputs/apk/debug/*.apk' | head -n 1)
+          if [ -z "$APK" ]; then
+            echo "ERROR: APK nahi bani"
+            exit 1
+          fi
+          echo "APK: $APK"
+          ls -lh "$APK"
+          unzip -l "$APK" | grep "assets/xposed_init"
+          echo "APK_PATH=$APK" >> "$GITHUB_ENV"
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: ThemeCompatFix-debug
+          path: ${{ env.APK_PATH }}
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Upload build reports
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-reports
+          path: |
+            **/build/reports/**
+          if-no-files-found: ignore
+          retention-days: 7
